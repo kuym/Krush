@@ -60,6 +60,7 @@ static char const* kCertString =
 
 enum Params {
   kActivityTimeout_ms =       (5 * 60 * 1000),    // 5 minutes
+  kMaxTxBacklog_bytes =       (64 * 1024),        // maximum subprocess output to buffer
 };
 
 
@@ -1585,7 +1586,15 @@ int main(int argc, char** argv) {
       tlsMustWrite = 0;
     }
 
-    if(gProcess && (tcpFD >= 0) && tls && SSL_is_init_finished(tls)) {
+    // Flow-control: only read more output from the child process while the
+    // unsent outbound backlog is under the limit.  Otherwise we can buffer
+    // huge amounts of I/O here and bad thigs will happen.
+    size_t txBacklog = processRxOffset + txBufferOffset;
+    if(tlsWrite) {
+      txBacklog += (size_t)BIO_pending(tlsWrite);
+    }
+    if(gProcess && (tcpFD >= 0) && tls && SSL_is_init_finished(tls) &&
+       (txBacklog < (size_t)kMaxTxBacklog_bytes)) {
       AsyncSet(ProcessStdout(gProcess), &readSet, &topFD);
       AsyncSet(ProcessStderr(gProcess), &readSet, &topFD);
     }
@@ -1725,24 +1734,60 @@ int main(int argc, char** argv) {
           fprintf(stderr, "TLS is not active, dropping received TCP bytes.\n");
         }
       }
-      if((tcpFD >= 0) && FD_ISSET(tcpFD, &writeSet)) {
-        ssize_t bytesRead = 0;
-        while((txBufferOffset < sizeof(txBuffer)) &&
-              (bytesRead = BIO_read(tlsWrite, &txBuffer[txBufferOffset], sizeof(txBuffer) - txBufferOffset)) > 0) {
-          txBufferOffset += bytesRead;
-          if(tls) {
-            ssize_t written = write(tcpFD, txBuffer, txBufferOffset);
-            if(written > 0) {
-              memmove(txBuffer, &txBuffer[written], sizeof(txBuffer) - written);
-              txBufferOffset -= written;
-            } else {
-              fprintf(stderr, "Error: TCP write error, OpenSSL bytes lost.\n");
+      if((tcpFD >= 0) && FD_ISSET(tcpFD, &writeSet) && tls) {
+        // Drain encrypted data to the socket. The socket write is intentionally
+        // decoupled from BIO_read, so it flushes whatever is already buffered in
+        // txBuffer first, then refills from the BIO. During flow-control the unsent
+        // bytes are sent later when writing becomes possible again.
+        int wouldBlock = 0;
+        while(1) {
+          if(txBufferOffset < sizeof(txBuffer)) {
+            ssize_t bytesRead = BIO_read(tlsWrite, &txBuffer[txBufferOffset], sizeof(txBuffer) - txBufferOffset);
+            if(bytesRead > 0) {
+              txBufferOffset += (size_t)bytesRead;
             }
-          } else {
-            fprintf(stderr, "Error: TLS is not active, dropping TCP bytes to be sent.\n");
           }
+          if(txBufferOffset == 0) {
+            break;  // nothing buffered and nothing left in the BIO
+          }
+
+          ssize_t written = write(tcpFD, txBuffer, txBufferOffset);
+          if(written > 0) {
+            lastActivityTimepoint = SystemTimePoint();  // outbound traffic is activity too
+            memmove(txBuffer, &txBuffer[written], txBufferOffset - (size_t)written);
+            txBufferOffset -= (size_t)written;
+            continue;  // keep draining
+          }
+
+          if((written < 0) &&
+             (errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR)) {
+            // A fatal write error, so there's have no choice but to shut down and lose data here
+            fprintf(stderr, "Error: TCP write error (%s); dropping connection.\n", strerror(errno));
+            close(tcpFD);
+            tcpFD = -1;
+            SSL_free(tls);
+            tls = 0;
+            tlsRead = 0;
+            tlsWrite = 0;
+            txBufferOffset = 0;
+            processRxOffset = 0;
+            if(gProcess) {
+              ProcessTerminate(gProcess);
+              ProcessDestroy(gProcess);
+              gProcess = 0;
+            }
+            break;
+          }
+
+          // written == 0 or EAGAIN/EWOULDBLOCK/EINTR. The socket send buffer is
+          // full, so we have to try later.
+          wouldBlock = 1;
+          break;
         }
-        tlsMustWrite = 0;
+        // Stay selected for writing while anything still needs to be sent.
+        tlsMustWrite = ((tcpFD >= 0) &&
+                        (wouldBlock || (txBufferOffset > 0) ||
+                         (tlsWrite && (BIO_pending(tlsWrite) > 0))))? 1 : 0;
       }
 
       if(tls && SSL_is_init_finished(tls)) {
